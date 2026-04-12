@@ -1,0 +1,7 @@
+SET hello world TTL 2
+DEL hello
+SET hello world
+SETXX hello test
+DEL hello
+SETNX hello test
+SETXX hello txt
