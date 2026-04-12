@@ -9,6 +9,116 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+pub async fn apply_storage_command(
+    element: &Vec<Frame>,
+    db_clone: &Arc<Mutex<HashMap<String, Entry>>>,
+) -> Result<(), String> {
+    if let Some(Frame::Bulk(command)) = element.get(0) {
+        let cmd = String::from_utf8_lossy(command).to_uppercase();
+        match cmd.as_str() {
+            "SET" => {
+                if let (Some(Frame::Bulk(key)), Some(Frame::Bulk(value))) =
+                    (element.get(1), element.get(2))
+                {
+                    let k = String::from_utf8_lossy(key).to_string();
+                    let mut ttl: Option<Instant> = None;
+                    if let (Some(Frame::Bulk(ttl_key)), Some(Frame::Bulk(ttl_time_bytes))) =
+                        (element.get(3), element.get(4))
+                    {
+                        if String::from_utf8_lossy(ttl_key).to_string() == "TTL" {
+                            let ttl_time_result = String::from_utf8_lossy(ttl_time_bytes)
+                                .to_string()
+                                .parse::<u64>();
+                            if let Ok(ttl_time_u64) = ttl_time_result {
+                                ttl = Some(Instant::now() + Duration::from_secs(ttl_time_u64));
+                            }
+                        }
+                    }
+                    let entry = Entry {
+                        data: value.clone(),
+                        ttl,
+                    };
+                    db_clone.lock().await.insert(k, entry);
+                    Ok(())
+                } else {
+                    Err("SET missing key/value".to_string())
+                }
+            }
+            "SETNX" => {
+                if let (Some(Frame::Bulk(key)), Some(Frame::Bulk(value))) =
+                    (element.get(1), element.get(2))
+                {
+                    let k = String::from_utf8_lossy(key).to_string();
+                    let mut db_lock = db_clone.lock().await;
+                    if db_lock.get(&k).is_none() {
+                        let entry = Entry {
+                            data: value.clone(),
+                            ttl: None,
+                        };
+                        db_lock.insert(k, entry);
+                    }
+                    Ok(())
+                } else {
+                    Err("SETNX missing key/value".to_string())
+                }
+            }
+            "SETXX" => {
+                if let (Some(Frame::Bulk(key)), Some(Frame::Bulk(value))) =
+                    (element.get(1), element.get(2))
+                {
+                    let k = String::from_utf8_lossy(key).to_string();
+                    let mut db_lock = db_clone.lock().await;
+                    if db_lock.get(&k).is_some() {
+                        let entry = Entry {
+                            data: value.clone(),
+                            ttl: None,
+                        };
+                        db_lock.insert(k, entry);
+                    }
+                    Ok(())
+                } else {
+                    Err("SETXX missing key/value".to_string())
+                }
+            }
+            "DEL" => {
+                if let Some(Frame::Bulk(key)) = element.get(1) {
+                    let key = String::from_utf8_lossy(key).to_string();
+                    db_clone.lock().await.remove(&key);
+                    Ok(())
+                } else {
+                    Err("DEL missing key".to_string())
+                }
+            }
+            "EXPIRE" => {
+                if let (Some(Frame::Bulk(key_element)), Some(Frame::Bulk(ttl_element))) =
+                    (element.get(1), element.get(2))
+                {
+                    let key = String::from_utf8_lossy(key_element).to_string();
+                    let ttl_result = String::from_utf8_lossy(ttl_element).parse::<u64>();
+                    if let Ok(ttl) = ttl_result {
+                        let mut db_lock = db_clone.lock().await;
+                        if let Some(entry) = db_lock.get(&key) {
+                            let new_entry = Entry {
+                                data: entry.data.clone(),
+                                ttl: Some(Instant::now() + Duration::from_secs(ttl)),
+                            };
+                            db_lock.insert(key, new_entry);
+                        }
+                        Ok(())
+                    } else {
+                        Err("EXPIRE ttl parse error".to_string())
+                    }
+                } else {
+                    Err("EXPIRE missing args".to_string())
+                }
+            }
+            _ => Err(format!("unsupported replay command: {}", cmd)),
+        }
+    } else {
+        Err("invalid command frame".to_string())
+    }
+}
+
 pub async fn ping(connection: &mut Connection) {
     connection
         .write_frame(&Frame::Simple("PONG".to_string()))
@@ -170,8 +280,6 @@ pub async fn keys(connection: &mut Connection, db_clone: &Arc<Mutex<HashMap<Stri
         .collect();
     connection.write_frame(&Frame::Array(keys)).await.unwrap();
 }
-
-
 
 pub async fn setnx(
     connection: &mut Connection,

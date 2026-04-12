@@ -1,13 +1,12 @@
 use crate::db::Entry;
+use crate::frame::Frame;
+use crate::handle::apply_storage_command;
 use crate::{AOF_ENABLE, AOF_FILE, AOF_RELOAD};
-use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 
 pub struct AOF {
     pub file: Mutex<File>,
@@ -43,29 +42,17 @@ impl AOF {
                 if !data.is_empty() {
                     let data_string = String::from_utf8_lossy(&data).to_string();
                     println!("从AOF文件同步数据");
-                    // 简单解析AOF文件中的SET命令
                     for line in data_string.lines() {
                         let line = line.trim();
                         if line.is_empty() {
                             continue;
                         }
-                        let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 3 && parts[0].to_uppercase() == "SET" {
-                            let key = parts[1].to_string();
-                            let value = Bytes::from(parts[2].as_bytes().to_vec());
-                            let mut ttl: Option<Instant> = None;
-                            if parts.len() > 3 && parts[3] == "TTL" {
-                                if let Ok(ttl_u64) = parts[4].parse::<u64>() {
-                                    ttl = Some(Instant::now() + Duration::from_secs(ttl_u64));
-                                }
-                            }
-                            let entry = Entry {
-                                data: value,
-                                ttl: ttl,
-                            };
-                            db_aof.lock().await.insert(key, entry);
-                        } else if parts[0] == "DEL" {
-                            db_aof.lock().await.remove(&parts[1].to_string());
+                        let frames: Vec<Frame> = line
+                            .split_whitespace()
+                            .map(|token| Frame::Bulk(token.to_string().into()))
+                            .collect();
+                        if let Err(err) = apply_storage_command(&frames, db_aof).await {
+                            println!("AOF重放跳过命令 [{}], 原因: {}", line, err);
                         }
                     }
                 }
